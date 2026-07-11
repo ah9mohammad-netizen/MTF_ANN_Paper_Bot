@@ -33,7 +33,6 @@ def main():
         return
 
     while True:
-        
     cfg=BotConfig()
     store=Store(cfg.db_path)
     brain=StrategyBrain(cfg.model_path,cfg.meta_path)
