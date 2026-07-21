@@ -13,6 +13,7 @@ from typing import Optional, Dict, Any, List
 from app.config import config
 from app.database import db
 from app.paper_trader import paper_trader
+from app.market_data import market_feed
 
 logger = logging.getLogger("TelegramUI")
 
@@ -199,7 +200,7 @@ class TelegramUI:
                 f"• Execution Mode: <b>{'PAPER TRADING ($100 Capital)' if config.PAPER_TRADING else 'LIVE TRADING'}</b>\n"
                 f"• Bot Status: <b>{'🟢 RUNNING 24/7' if paper_trader.is_running else '🟡 PAUSED'}</b>\n"
                 f"• Target Symbol: <b>{config.SYMBOL} ({config.EXCHANGE_ID.upper()})</b>\n"
-                f"• Last Market Price: <b>${paper_trader.last_simulated_price:.2f} / oz</b>\n"
+                f"• Last Market Price: <b>${market_feed.last_known_price:.2f} / oz</b>\n"
                 f"• Max Leverage: <b>{config.MAX_LEVERAGE}x</b>\n"
                 f"• Open Active Trades: <b>{len(open_trades)}</b>\n"
                 f"• Storage Path (`Volume`): <code>{db.db_path}</code> (<b>{file_size_kb:.1f} KB</b>)\n"
@@ -296,16 +297,16 @@ class TelegramUI:
             from datetime import datetime, timezone
             dummy_market = {
                 "timestamp": datetime.now(timezone.utc),
-                "close": paper_trader.last_simulated_price,
+                "close": market_feed.last_known_price,
                 "spread": 0.15,
                 "atr_14": 2.40,
                 "rsi_14": 64.0 if direction == "LONG" else 36.0,
-                "ema_200": paper_trader.last_simulated_price - 10 if direction == "LONG" else paper_trader.last_simulated_price + 10,
-                "vwap": paper_trader.last_simulated_price - 3 if direction == "LONG" else paper_trader.last_simulated_price + 3,
-                "asian_high": paper_trader.last_simulated_price - 2,
-                "asian_low": paper_trader.last_simulated_price - 12,
-                "high": paper_trader.last_simulated_price + 0.5,
-                "low": paper_trader.last_simulated_price - 0.5,
+                "ema_200": market_feed.last_known_price - 10 if direction == "LONG" else market_feed.last_known_price + 10,
+                "vwap": market_feed.last_known_price - 3 if direction == "LONG" else market_feed.last_known_price + 3,
+                "asian_high": market_feed.last_known_price - 2,
+                "asian_low": market_feed.last_known_price - 12,
+                "high": market_feed.last_known_price + 0.5,
+                "low": market_feed.last_known_price - 0.5,
                 "force_signal": True,
                 "force_direction": direction
             }
