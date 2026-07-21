@@ -1,16 +1,20 @@
 # =========================================================================================
 # 🪙 GOOGLE COLAB COPY-PASTE READY: 1-Year Real Historical Gold Backtester (XAU-USDT 5m)
 # =========================================================================================
-# Copy and paste this entire code cell into Google Colab (https://colab.research.google.com)
+# Copy and paste this entire code block into Google Colab (https://colab.research.google.com)
 # and press Shift + Enter to download 1 year of real historical 5m Gold candles (~105,120 bars)
 # and execute the exact 4-Layer Decision Engine with real exchange fees (0.04%) and slippage.
+#
+# NOTE ON GEO-BLOCKING:
+# Bybit (HTTP 403) and Binance (HTTP 451) automatically block Google Colab US data centers.
+# This script uses OKX V5 Public `history-candles` API (XAU-USDT-SWAP) and Gate.io (PAXG_USDT),
+# which DO NOT geo-block Google Colab and allow full 1-year historical downloads at top speed!
 # =========================================================================================
 
 import urllib.request
 import json
 import time
 import math
-import sqlite3
 from datetime import datetime, timezone, timedelta
 
 # --- 1. CONFIGURATION ---
@@ -21,7 +25,7 @@ RISK_PER_TRADE_PCT = 1.5  # Risk 1.5% ($1.50 per scalp on $100 starting equity)
 MAX_SPREAD_USD = 0.45
 COMMISSION_RATE = 0.0004  # 0.04% round-trip exchange fee
 SLIPPAGE_PER_OZ = 0.12    # $0.12/oz execution slippage friction
-MAX_ORDER_OZ = 50.0       # Bybit/Apex Tier 1 contract lot depth ceiling
+MAX_ORDER_OZ = 50.0       # Exchange Tier 1 contract lot depth ceiling
 
 # Active Sessions (UTC): London Open (07:00-10:00) & NY Overlap (12:00-16:00)
 ALLOWED_SESSIONS = [(7, 10), (12, 16)]
@@ -78,25 +82,29 @@ class TechnicalIndicators:
         return 100.0 - (100.0 / (1.0 + rs))
 
 
-# --- 3. REAL HISTORICAL DATA DOWNLOADER (BYBIT & BINANCE PAGINATED) ---
+# --- 3. NON-GEO-BLOCKED REAL HISTORICAL DATA DOWNLOADER (OKX & GATE.IO) ---
 def download_real_historical_klines(target_bars=TARGET_BARS):
-    print(f"⏳ Connecting to public exchange APIs to download {target_bars:,} real historical 5m Gold candles (~1 Year)...")
+    print(f"⏳ Connecting to non-geo-blocked public APIs (OKX / Gate.io) to download up to {target_bars:,} real 5m Gold candles...")
     all_bars = {}
-    end_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     
-    # Step A: Download Bybit Linear Futures XAUUSDT (limit=1000 per request)
+    # Step A: Download OKX V5 history-candles for XAU-USDT-SWAP (No 403 or 451 geo-block in Colab!)
+    after_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     pages = 0
+    
     while len(all_bars) < target_bars:
         try:
-            url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol=XAUUSDT&interval=5&limit=1000&end={end_time_ms}"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            url = f"https://www.okx.com/api/v5/market/history-candles?instId=XAU-USDT-SWAP&bar=5m&limit=100&after={after_ms}"
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                "Accept": "application/json"
+            })
             with urllib.request.urlopen(req, timeout=10.0) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 
-            if not data or data.get("retCode") != 0 or not data.get("result", {}).get("list"):
+            if not data or data.get("code") != "0" or not data.get("data"):
                 break
                 
-            raw_list = data["result"]["list"]
+            raw_list = data["data"]
             if not raw_list:
                 break
                 
@@ -110,32 +118,34 @@ def download_real_historical_klines(target_bars=TARGET_BARS):
                     "low": float(item[3]),
                     "close": float(item[4]),
                     "volume": float(item[5]) if float(item[5]) > 0 else 1.0,
-                    "symbol": "BYBIT_XAUUSDT"
+                    "symbol": "OKX_XAU-USDT-SWAP"
                 }
                 
+            # OKX returns newest first. Oldest bar in batch is raw_list[-1][0]
             oldest_ts_ms = int(raw_list[-1][0])
-            if oldest_ts_ms >= end_time_ms:
+            if oldest_ts_ms >= after_ms:
                 break
-            end_time_ms = oldest_ts_ms - 1
+            after_ms = oldest_ts_ms - 1
             pages += 1
-            if pages % 10 == 0:
-                print(f"   [Bybit] Downloaded {len(all_bars):,} / {target_bars:,} candles...")
+            if pages % 15 == 0:
+                print(f"   [OKX XAU-USDT-SWAP] Downloaded {len(all_bars):,} / {target_bars:,} candles...")
             time.sleep(0.12)
         except Exception as e:
-            print(f"   ⚠️ Bybit batch fetch paused: {e}")
+            print(f"   ⚠️ OKX batch fetch paused or completed: {e}")
             break
 
-    # Step B: If needed, backfill older history using Binance PAXGUSDT
+    # Step B: If needed, backfill older history using Gate.io PAXG_USDT API (limit=1000, no US geo-block)
     if len(all_bars) < target_bars:
-        print(f"🔄 Backfilling remaining {target_bars - len(all_bars):,} bars from Binance PAXGUSDT API...")
+        print(f"🔄 Backfilling remaining {target_bars - len(all_bars):,} bars from Gate.io PAXG_USDT API (limit=1000)...")
         if all_bars:
-            end_time_ms = min(all_bars.keys()) - 1
+            to_ts_sec = int(min(all_bars.keys()) / 1000)
         else:
-            end_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            to_ts_sec = int(datetime.now(timezone.utc).timestamp())
             
+        gate_pages = 0
         while len(all_bars) < target_bars:
             try:
-                url = f"https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval=5m&limit=1000&endTime={end_time_ms}"
+                url = f"https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair=PAXG_USDT&interval=5m&limit=1000&to={to_ts_sec}"
                 req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
                 with urllib.request.urlopen(req, timeout=10.0) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
@@ -143,29 +153,30 @@ def download_real_historical_klines(target_bars=TARGET_BARS):
                 if not data or not isinstance(data, list) or not data:
                     break
                     
+                # Gate.io returns: [timestamp_s, volume, close, high, low, open]
                 for item in data:
-                    ts_ms = int(item[0])
+                    ts_ms = int(item[0]) * 1000
                     all_bars[ts_ms] = {
                         "timestamp_ms": ts_ms,
                         "timestamp": datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc),
-                        "open": float(item[1]),
-                        "high": float(item[2]),
-                        "low": float(item[3]),
-                        "close": float(item[4]),
-                        "volume": float(item[5]) if float(item[5]) > 0 else 1.0,
-                        "symbol": "BINANCE_PAXGUSDT"
+                        "open": float(item[5]),
+                        "high": float(item[3]),
+                        "low": float(item[4]),
+                        "close": float(item[2]),
+                        "volume": float(item[1]) if float(item[1]) > 0 else 1.0,
+                        "symbol": "GATEIO_PAXG_USDT"
                     }
                     
-                oldest_ts_ms = int(data[0][0])
-                if oldest_ts_ms >= end_time_ms:
+                oldest_ts_sec = int(data[0][0])
+                if oldest_ts_sec >= to_ts_sec:
                     break
-                end_time_ms = oldest_ts_ms - 1
-                pages += 1
-                if pages % 10 == 0:
-                    print(f"   [Binance] Total downloaded {len(all_bars):,} / {target_bars:,} candles...")
+                to_ts_sec = oldest_ts_sec - 1
+                gate_pages += 1
+                if gate_pages % 5 == 0:
+                    print(f"   [Gate.io] Total downloaded {len(all_bars):,} / {target_bars:,} candles...")
                 time.sleep(0.12)
             except Exception as e:
-                print(f"   ⚠️ Binance batch fetch paused: {e}")
+                print(f"   ⚠️ Gate.io batch fetch paused: {e}")
                 break
 
     sorted_bars = sorted(all_bars.values(), key=lambda x: x["timestamp_ms"])
@@ -272,7 +283,7 @@ class LayeredDecisionEngine:
 
 # --- 5. EVENT-DRIVEN BACKTEST ENGINE ---
 def run_quantitative_backtest(raw_bars):
-    print(f"🚀 Running exact event-driven backtest across {len(raw_bars):,} real historical exchange bars...")
+    print(f"\n🚀 Running exact event-driven backtest across {len(raw_bars):,} real historical exchange bars...")
     engine = LayeredDecisionEngine()
     tech = TechnicalIndicators()
     
@@ -298,7 +309,6 @@ def run_quantitative_backtest(raw_bars):
         low = bar["low"]
         now_dt = bar["timestamp"]
         
-        # Pre-compute exact indicator values up to last 200 bars
         start_slice = max(0, idx - 200)
         slice_closes = closes[start_slice : idx + 1]
         slice_highs = highs[start_slice : idx + 1]
@@ -449,7 +459,6 @@ def run_quantitative_backtest(raw_bars):
     
     decisive_trades = len(tp_wins) + len(sl_losses)
     effective_win_rate = round((len(tp_wins) / decisive_trades) * 100.0, 2) if decisive_trades > 0 else 0.0
-    raw_win_rate = round((len(net_wins) / total_trades) * 100.0, 2) if total_trades > 0 else 0.0
     
     net_profit_sum = sum(t["pnl_usd"] for t in net_wins)
     net_loss_sum = abs(sum(t["pnl_usd"] for t in net_losses))
@@ -482,4 +491,4 @@ if __name__ == "__main__":
     if real_candles:
         run_quantitative_backtest(real_candles)
     else:
-        print("❌ Could not download real historical candles. Check internet connectivity.")
+        print("❌ Could not download real historical candles. Check Colab internet connection.")
