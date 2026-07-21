@@ -1,6 +1,6 @@
 """
 Database engine for XAU-USDT Scalping Bot.
-Manages Signals, Trades, and Account Balance history using SQLite (or PostgreSQL via DATABASE_URL).
+Manages Signals, Trades, and Account Balance history inside History.db (saved in /data Volume on Railway).
 """
 import os
 import sqlite3
@@ -14,15 +14,27 @@ logger = logging.getLogger("DatabaseEngine")
 class DatabaseEngine:
     def __init__(self, db_path: Optional[str] = None):
         if db_path is None:
-            # Parse path from config.DATABASE_URL if sqlite
             if config.DATABASE_URL.startswith("sqlite:///"):
                 self.db_path = config.DATABASE_URL.replace("sqlite:///", "")
             else:
-                self.db_path = "gold_scalp.db"
+                self.db_path = config.DB_PATH
         else:
             self.db_path = db_path
             
+        self._ensure_directory()
         self._init_db()
+
+    def _ensure_directory(self):
+        """Ensures that the directory containing History.db (e.g. /data on Railway Volume) exists."""
+        abs_path = os.path.abspath(self.db_path)
+        dir_name = os.path.dirname(abs_path)
+        if dir_name and not os.path.exists(dir_name):
+            try:
+                os.makedirs(dir_name, exist_ok=True)
+                logger.info(f"Created database directory path: {dir_name}")
+            except PermissionError:
+                logger.warning(f"Permission denied creating {dir_name}. Falling back to local ./History.db")
+                self.db_path = "History.db"
 
     def _get_connection(self) -> sqlite3.Connection:
         conn = sqlite3.Connection(self.db_path, timeout=30.0)
@@ -100,7 +112,7 @@ class DatabaseEngine:
                 INSERT INTO account_history (timestamp, balance_before, balance_after, change_usd, change_reason, trade_id)
                 VALUES (?, ?, ?, ?, ?, NULL)
                 """, (now_str, 0.0, config.INITIAL_BALANCE_USDT, config.INITIAL_BALANCE_USDT, "INITIAL_DEPOSIT"))
-                logger.info(f"Initialized paper trading account balance with ${config.INITIAL_BALANCE_USDT:.2f} USDT")
+                logger.info(f"Initialized paper trading account balance with ${config.INITIAL_BALANCE_USDT:.2f} USDT in {self.db_path}")
                 
             conn.commit()
 
@@ -243,7 +255,8 @@ class DatabaseEngine:
                 "best_trade_usd": round(best_trade, 2),
                 "worst_trade_usd": round(worst_trade, 2),
                 "current_balance": round(current_bal, 2),
-                "initial_balance": config.INITIAL_BALANCE_USDT
+                "initial_balance": config.INITIAL_BALANCE_USDT,
+                "db_path": self.db_path
             }
 
 # Global DB engine instance

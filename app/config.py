@@ -37,8 +37,12 @@ class AppConfig:
     TP1_RR_RATIO: float = 2.0
     TP2_RR_RATIO: float = 3.5
     
-    # Database Configuration (SQLite by default, PostgreSQL on Railway when attached)
-    DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./gold_scalp.db")
+    # Database Configuration (Railway Volume path /data/History.db by default if /data exists or requested)
+    DB_PATH: str = os.getenv(
+        "DB_PATH",
+        "/data/History.db" if os.path.exists("/data") or os.getenv("RAILWAY_VOLUME_NAME") else "History.db"
+    )
+    DATABASE_URL: str = os.getenv("DATABASE_URL", f"sqlite:///{DB_PATH}")
     
     # Telegram UI Configuration
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")

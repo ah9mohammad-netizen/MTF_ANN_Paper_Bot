@@ -1,12 +1,14 @@
 """
 Telegram Bot UI & Bidirectional Communication Engine.
-Provides interactive commands (/status, /balance, /signals, /trades, /stats, /close_all) and live push alerts.
+Provides interactive commands (/status, /balance, /signals, /trades, /stats, /close_all, /get_db) and live push alerts.
 """
 import asyncio
 import json
 import logging
+import os
 import urllib.request
 import urllib.parse
+import uuid
 from typing import Optional, Dict, Any, List
 from app.config import config
 from app.database import db
@@ -37,6 +39,63 @@ class TelegramUI:
             logger.debug(f"Telegram API request failed ({method}): {e}")
             return None
 
+    def _send_document_sync(self, chat_id: str, file_path: str, caption: str = "") -> Optional[Dict[str, Any]]:
+        """Synchronous multipart/form-data request to send History.db directly over Telegram."""
+        if not self.token or not chat_id:
+            logger.info(f"[TELEGRAM LOG ONLY - NO TOKEN SET] Would send database file: {file_path}")
+            return None
+        if not os.path.exists(file_path):
+            logger.error(f"Cannot send database file: {file_path} does not exist on disk.")
+            return None
+            
+        try:
+            boundary = f"----WebKitFormBoundary{uuid.uuid4().hex}"
+            url = self.base_url + "sendDocument"
+            
+            with open(file_path, "rb") as f:
+                file_bytes = f.read()
+                
+            filename = os.path.basename(file_path)
+            body = []
+            
+            # chat_id
+            body.append(f"--{boundary}\r\n".encode("utf-8"))
+            body.append('Content-Disposition: form-data; name="chat_id"\r\n\r\n'.encode("utf-8"))
+            body.append(f"{chat_id}\r\n".encode("utf-8"))
+            
+            # caption & parse_mode
+            if caption:
+                body.append(f"--{boundary}\r\n".encode("utf-8"))
+                body.append('Content-Disposition: form-data; name="caption"\r\n\r\n'.encode("utf-8"))
+                body.append(f"{caption}\r\n".encode("utf-8"))
+                body.append(f"--{boundary}\r\n".encode("utf-8"))
+                body.append('Content-Disposition: form-data; name="parse_mode"\r\n\r\n'.encode("utf-8"))
+                body.append(b"HTML\r\n")
+                
+            # document binary
+            body.append(f"--{boundary}\r\n".encode("utf-8"))
+            body.append(f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n'.encode("utf-8"))
+            body.append('Content-Type: application/x-sqlite3\r\n\r\n'.encode("utf-8"))
+            body.append(file_bytes)
+            body.append(b"\r\n")
+            
+            body.append(f"--{boundary}--\r\n".encode("utf-8"))
+            req_data = b"".join(body)
+            
+            req = urllib.request.Request(
+                url,
+                data=req_data,
+                headers={
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                    "Content-Length": str(len(req_data))
+                }
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            logger.error(f"Telegram API sendDocument failed: {e}")
+            return None
+
     async def send_message(self, text: str, parse_mode: str = "HTML", chat_id: Optional[str] = None):
         """Sends an async push notification/alert to the user via Telegram."""
         target_chat = chat_id or self.chat_id
@@ -53,6 +112,15 @@ class TelegramUI:
                 "parse_mode": parse_mode,
                 "disable_web_page_preview": True
             })
+        )
+
+    async def send_document(self, file_path: str, caption: str = "", chat_id: Optional[str] = None):
+        """Sends an async file attachment (e.g. History.db from Railway Volume) to Telegram."""
+        target_chat = chat_id or self.chat_id
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: self._send_document_sync(target_chat, file_path, caption)
         )
 
     async def poll_updates_loop(self):
@@ -95,8 +163,9 @@ class TelegramUI:
             msg = (
                 "🪙 <b>XAU-USDT Quantitative Paper Trading Bot UI</b>\n\n"
                 "Available Commands:\n"
-                "• /status - Check 24/7 bot status, spread & current price\n"
+                "• /status - Check 24/7 bot status, spread & database path\n"
                 "• /balance - View current paper trading balance ($100 starting)\n"
+                "• /get_db - Download `History.db` file from Railway Volume to analyze\n"
                 "• /signals - List last 5 signals from the database\n"
                 "• /trades - View active open trades and closed history\n"
                 "• /stats - Comprehensive performance statistics & win rate\n"
@@ -108,8 +177,23 @@ class TelegramUI:
             )
             await self.send_message(msg, chat_id=chat_id)
 
+        elif cmd_lower in ("/get_db", "/export_db", "/download_data"):
+            st = db.get_statistics()
+            file_size_kb = os.path.getsize(db.db_path) / 1024 if os.path.exists(db.db_path) else 0
+            caption = (
+                "📦 <b>XAU-USDT Trading History Database (`History.db`)</b>\n\n"
+                f"• Volume Storage Path: <code>{db.db_path}</code>\n"
+                f"• File Size: <b>{file_size_kb:.1f} KB</b>\n"
+                f"• Total Recorded Trades: <b>{st['total_trades']}</b>\n"
+                f"• Current Equity Balance: <b>${st['current_balance']:.2f} USDT</b>\n"
+                "💡 <i>Open this file using any SQLite viewer (DB Browser for SQLite, DBeaver, or Python pandas) to analyze order flow and optimize your strategy!</i>"
+            )
+            await self.send_message("⏳ Preparing and uploading `History.db` from Railway Volume...", chat_id=chat_id)
+            await self.send_document(db.db_path, caption=caption, chat_id=chat_id)
+
         elif cmd_lower == "/status":
             open_trades = db.get_open_trades()
+            file_size_kb = os.path.getsize(db.db_path) / 1024 if os.path.exists(db.db_path) else 0
             msg = (
                 "⚙️ <b>XAU-USDT Scalping Bot Status</b>\n\n"
                 f"• Execution Mode: <b>{'PAPER TRADING ($100 Capital)' if config.PAPER_TRADING else 'LIVE TRADING'}</b>\n"
@@ -118,6 +202,7 @@ class TelegramUI:
                 f"• Last Market Price: <b>${paper_trader.last_simulated_price:.2f} / oz</b>\n"
                 f"• Max Leverage: <b>{config.MAX_LEVERAGE}x</b>\n"
                 f"• Open Active Trades: <b>{len(open_trades)}</b>\n"
+                f"• Storage Path (`Volume`): <code>{db.db_path}</code> (<b>{file_size_kb:.1f} KB</b>)\n"
                 f"• Database Engine: <b>Connected & Ready</b>"
             )
             await self.send_message(msg, chat_id=chat_id)
@@ -138,9 +223,9 @@ class TelegramUI:
         elif cmd_lower == "/signals":
             signals = db.get_recent_signals(limit=5)
             if not signals:
-                await self.send_message("📡 No trading signals recorded in database yet.", chat_id=chat_id)
+                await self.send_message("📡 No trading signals recorded in `History.db` yet.", chat_id=chat_id)
                 return
-            msg_lines = ["📡 <b>Recent Database Signals (Top 5)</b>\n"]
+            msg_lines = ["📡 <b>Recent Database Signals (`History.db` Top 5)</b>\n"]
             for s in signals:
                 dt_str = s["timestamp"].split("T")[1][:8] if "T" in s["timestamp"] else s["timestamp"][:19]
                 msg_lines.append(
@@ -153,7 +238,7 @@ class TelegramUI:
         elif cmd_lower == "/trades":
             open_t = db.get_open_trades()
             closed_t = db.get_recent_trades(limit=5)
-            msg_lines = ["📊 <b>Trades Management Panel</b>\n"]
+            msg_lines = ["📊 <b>Trades Management Panel (`History.db`)</b>\n"]
             if open_t:
                 msg_lines.append("🟢 <b>ACTIVE OPEN TRADES:</b>")
                 for t in open_t:
@@ -188,7 +273,8 @@ class TelegramUI:
                 f"• Total PnL: <b>${st['total_pnl_usd']:+.2f} USDT ({st['total_return_pct']:+.2f}%)</b>\n"
                 f"• Best Trade: <b>${st['best_trade_usd']:+.2f}</b>\n"
                 f"• Worst Trade: <b>${st['worst_trade_usd']:+.2f}</b>\n"
-                f"• Account Balance: <b>${st['current_balance']:.2f} / ${st['initial_balance']:.2f} USDT</b>"
+                f"• Account Balance: <b>${st['current_balance']:.2f} / ${st['initial_balance']:.2f} USDT</b>\n"
+                f"• Database Path: <code>{st['db_path']}</code>"
             )
             await self.send_message(msg, chat_id=chat_id)
 
