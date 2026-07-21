@@ -1,7 +1,8 @@
 """
 Live Market Data Feed Engine for XAU-USDT.
-Fetches real-time live OHLCV & orderbook spread directly from Bybit Linear Futures (XAUUSDT) and Phemex (cXAUUSDT),
-ensuring exact synchronization with TradingView XAU-USDT (~$4,069/oz).
+STRICT REAL-TIME LIVE DATA ONLY — NO SYNTHETIC OR RANDOM PRICE GENERATION.
+Uses CCXT and multi-exchange REST APIs (Bybit, Binance, OKX, Phemex) to fetch exact live OHLCV & spread.
+If exchange connection fails or times out, returns None (never generates fake prices).
 """
 import asyncio
 import json
@@ -14,22 +15,87 @@ from app.engine import TechnicalIndicators
 
 logger = logging.getLogger("LiveMarketData")
 
+# Try importing ccxt if available on Railway worker
+try:
+    import ccxt
+    CCXT_AVAILABLE = True
+except ImportError:
+    CCXT_AVAILABLE = False
+
 class LiveMarketDataFeed:
     """
-    Connects to live public exchange APIs to ingest real-time XAU-USDT 5m bars and orderbook spread.
-    Prioritizes true Gold Perpetual Futures (Bybit XAUUSDT & Phemex cXAUUSDT ~ $4,069)
-    so price matches TradingView exactly, avoiding tokenized PAXG premium ($4,116).
+    Connects to live public exchange APIs (CCXT + Bybit/Binance/OKX/Phemex REST) to ingest real-time XAU-USDT 5m bars and spread.
+    Computes real-time EMA 200, VWAP, Asian High/Low, ATR 14, and RSI 14 directly from real exchange candles.
+    STRICT RULE: If all exchange connections fail, returns None. Never generates random synthetic prices.
     """
     def __init__(self):
         self.tech = TechnicalIndicators()
-        self.last_known_price = 4069.00  # Exact XAU-USDT baseline
-        self.simulated_cycle = 0
+        self.last_known_price = 0.0
+        self.last_valid_source = "NONE"
 
-    def _fetch_from_bybit_xau_sync(self) -> Optional[Dict[str, Any]]:
-        """Queries Bybit V5 API specifically for Linear Futures XAUUSDT (matches TradingView ~$4,069)."""
+    def _fetch_via_ccxt_sync(self) -> Optional[Dict[str, Any]]:
+        """Queries exchanges via CCXT library (handles rate limits, Cloudflare headers, and unified symbols)."""
+        if not CCXT_AVAILABLE:
+            return None
+
+        exchanges_to_try = [
+            ("bybit", "XAU/USDT:USDT"),     # Bybit linear Gold perp
+            ("binance", "PAXG/USDT"),       # Binance PAXG spot/perp
+            ("okx", "XAU-USDT-SWAP"),       # OKX Gold swap
+            ("phemex", "XAU/USDT:USDT")     # Phemex Gold perp
+        ]
+
+        for ex_id, symbol in exchanges_to_try:
+            try:
+                ex_class = getattr(ccxt, ex_id, None)
+                if not ex_class:
+                    continue
+                exchange = ex_class({
+                    "timeout": 7000,
+                    "enableRateLimit": True
+                })
+                
+                # Fetch last 200 5m OHLCV bars: [timestamp, open, high, low, close, volume]
+                ohlcv = exchange.fetch_ohlcv(symbol, timeframe="5m", limit=200)
+                if not ohlcv or len(ohlcv) < 20:
+                    continue
+                    
+                closes = [float(bar[4]) for bar in ohlcv]
+                highs = [float(bar[2]) for bar in ohlcv]
+                lows = [float(bar[3]) for bar in ohlcv]
+                
+                latest_bar = ohlcv[-1]
+                latest_close = float(latest_bar[4])
+                latest_high = float(latest_bar[2])
+                latest_low = float(latest_bar[3])
+                
+                # Fetch ticker for spread
+                spread = 0.15
+                try:
+                    ticker = exchange.fetch_ticker(symbol)
+                    bid = float(ticker.get("bid") or (latest_close - 0.08))
+                    ask = float(ticker.get("ask") or (latest_close + 0.08))
+                    if ask > bid > 0:
+                        spread = round(ask - bid, 2)
+                except Exception:
+                    pass
+                    
+                self.last_known_price = latest_close
+                self.last_valid_source = f"LIVE_CCXT_{ex_id.upper()}_{symbol}"
+                return self._build_tick_result(self.last_valid_source, ohlcv, closes, highs, lows, latest_close, latest_high, latest_low, spread)
+            except Exception as e:
+                logger.debug(f"CCXT {ex_id} ({symbol}) fetch failed: {e}")
+                continue
+        return None
+
+    def _fetch_bybit_rest_sync(self) -> Optional[Dict[str, Any]]:
+        """Queries Bybit V5 REST API directly for Linear Futures XAUUSDT."""
         try:
             url = "https://api.bybit.com/v5/market/kline?category=linear&symbol=XAUUSDT&interval=5&limit=200"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Quantitative Gold-Scalp Bot)"})
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                "Accept": "application/json"
+            })
             with urllib.request.urlopen(req, timeout=6.0) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 
@@ -47,12 +113,11 @@ class LiveMarketDataFeed:
             latest_close = float(latest_bar[4])
             latest_high = float(latest_bar[2])
             latest_low = float(latest_bar[3])
-            self.last_known_price = latest_close
             
             spread = 0.15
             try:
                 t_url = "https://api.bybit.com/v5/market/tickers?category=linear&symbol=XAUUSDT"
-                req_t = urllib.request.Request(t_url, headers={"User-Agent": "Mozilla/5.0 (Quantitative Gold-Scalp Bot)"})
+                req_t = urllib.request.Request(t_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
                 with urllib.request.urlopen(req_t, timeout=4.0) as resp_t:
                     data_t = json.loads(resp_t.read().decode("utf-8"))
                     if data_t and data_t.get("retCode") == 0 and data_t.get("result", {}).get("list"):
@@ -63,52 +128,18 @@ class LiveMarketDataFeed:
             except Exception:
                 pass
                 
-            return self._build_tick_result("LIVE_EXCHANGE_BYBIT_XAUUSDT", raw_list, closes, highs, lows, latest_close, latest_high, latest_low, spread)
-        except Exception as e:
-            logger.debug(f"Bybit XAUUSDT fetch failed: {e}")
-            return None
-
-    def _fetch_from_phemex_xau_sync(self) -> Optional[Dict[str, Any]]:
-        """Queries Phemex public kline API for cXAUUSDT (Gold Perp ~$4,069)."""
-        try:
-            url = "https://api.phemex.com/exchange/public/md/kline?symbol=cXAUUSDT&resolution=300&limit=200"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Quantitative Gold-Scalp Bot)"})
-            with urllib.request.urlopen(req, timeout=6.0) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                
-            if not data or not data.get("data") or not isinstance(data["data"]["rows"], list):
-                return None
-                
-            rows = data["data"]["rows"]
-            if len(rows) < 20:
-                return None
-                
-            def parse_px(val):
-                f_val = float(val)
-                if f_val > 1000000:  # Scaled 10^4
-                    return f_val / 10000.0
-                return f_val
-
-            closes = [parse_px(item[6]) for item in rows]
-            highs = [parse_px(item[4]) for item in rows]
-            lows = [parse_px(item[5]) for item in rows]
-            
-            latest_bar = rows[-1]
-            latest_close = parse_px(latest_bar[6])
-            latest_high = parse_px(latest_bar[4])
-            latest_low = parse_px(latest_bar[5])
             self.last_known_price = latest_close
-            
-            return self._build_tick_result("LIVE_EXCHANGE_PHEMEX_cXAUUSDT", rows, closes, highs, lows, latest_close, latest_high, latest_low, 0.22)
+            self.last_valid_source = "LIVE_REST_BYBIT_XAUUSDT"
+            return self._build_tick_result(self.last_valid_source, raw_list, closes, highs, lows, latest_close, latest_high, latest_low, spread)
         except Exception as e:
-            logger.debug(f"Phemex cXAUUSDT fetch failed: {e}")
+            logger.debug(f"Bybit REST fetch failed: {e}")
             return None
 
-    def _fetch_from_binance_paxg_sync(self) -> Optional[Dict[str, Any]]:
-        """Queries Binance PAXGUSDT (used only as emergency fallback if pure XAU futures are offline)."""
+    def _fetch_binance_rest_sync(self) -> Optional[Dict[str, Any]]:
+        """Queries Binance REST API for PAXGUSDT."""
         try:
             url = "https://api.binance.com/api/v3/klines?symbol=PAXGUSDT&interval=5m&limit=200"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Quantitative Gold-Scalp Bot)"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
             with urllib.request.urlopen(req, timeout=6.0) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 
@@ -123,12 +154,11 @@ class LiveMarketDataFeed:
             latest_close = float(latest_bar[4])
             latest_high = float(latest_bar[2])
             latest_low = float(latest_bar[3])
-            self.last_known_price = latest_close
             
             spread = 0.20
             try:
                 t_url = "https://api.binance.com/api/v3/ticker/bookTicker?symbol=PAXGUSDT"
-                req_t = urllib.request.Request(t_url, headers={"User-Agent": "Mozilla/5.0 (Quantitative Gold-Scalp Bot)"})
+                req_t = urllib.request.Request(t_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
                 with urllib.request.urlopen(req_t, timeout=4.0) as resp_t:
                     t_data = json.loads(resp_t.read().decode("utf-8"))
                     bid = float(t_data.get("bidPrice", latest_close - 0.10))
@@ -138,9 +168,41 @@ class LiveMarketDataFeed:
             except Exception:
                 pass
                 
-            return self._build_tick_result("LIVE_EXCHANGE_BINANCE_PAXGUSDT", data, closes, highs, lows, latest_close, latest_high, latest_low, spread)
+            self.last_known_price = latest_close
+            self.last_valid_source = "LIVE_REST_BINANCE_PAXGUSDT"
+            return self._build_tick_result(self.last_valid_source, data, closes, highs, lows, latest_close, latest_high, latest_low, spread)
         except Exception as e:
-            logger.debug(f"Binance PAXGUSDT fetch failed: {e}")
+            logger.debug(f"Binance REST fetch failed: {e}")
+            return None
+
+    def _fetch_okx_rest_sync(self) -> Optional[Dict[str, Any]]:
+        """Queries OKX REST API for XAU-USDT-SWAP."""
+        try:
+            url = "https://www.okx.com/api/v5/market/candles?instId=XAU-USDT-SWAP&bar=5m&limit=200"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            with urllib.request.urlopen(req, timeout=6.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                
+            if not data or data.get("code") != "0" or not data.get("data"):
+                return None
+                
+            raw_list = data["data"]
+            raw_list.reverse()
+            
+            closes = [float(item[4]) for item in raw_list]
+            highs = [float(item[2]) for item in raw_list]
+            lows = [float(item[3]) for item in raw_list]
+            
+            latest_bar = raw_list[-1]
+            latest_close = float(latest_bar[4])
+            latest_high = float(latest_bar[2])
+            latest_low = float(latest_bar[3])
+            
+            self.last_known_price = latest_close
+            self.last_valid_source = "LIVE_REST_OKX_XAU-USDT-SWAP"
+            return self._build_tick_result(self.last_valid_source, raw_list, closes, highs, lows, latest_close, latest_high, latest_low, 0.18)
+        except Exception as e:
+            logger.debug(f"OKX REST fetch failed: {e}")
             return None
 
     def _build_tick_result(self, source_name: str, raw_bars: list, closes: List[float], highs: List[float], lows: List[float], latest_close: float, latest_high: float, latest_low: float, spread: float) -> Dict[str, Any]:
@@ -181,23 +243,31 @@ class LiveMarketDataFeed:
         }
 
     def _fetch_live_market_data_sync(self) -> Optional[Dict[str, Any]]:
-        """Prioritizes pure XAU-USDT Futures (~$4,069) over tokenized PAXG spot (~$4,116)."""
-        tick = self._fetch_from_bybit_xau_sync()
+        """
+        Tries redundant live exchanges in strict sequence:
+        1. CCXT multi-exchange (Bybit -> Binance -> OKX -> Phemex)
+        2. Direct REST Bybit XAUUSDT Linear
+        3. Direct REST OKX XAU-USDT Swap
+        4. Direct REST Binance PAXGUSDT
+        """
+        tick = self._fetch_via_ccxt_sync()
         if tick:
             return tick
-        tick = self._fetch_from_phemex_xau_sync()
+        tick = self._fetch_bybit_rest_sync()
         if tick:
             return tick
-        # Fallback to PAXG if exact XAU futures APIs are unavailable
-        tick = self._fetch_from_binance_paxg_sync()
+        tick = self._fetch_okx_rest_sync()
+        if tick:
+            return tick
+        tick = self._fetch_binance_rest_sync()
         if tick:
             return tick
         return None
 
-    async def get_latest_market_tick(self) -> Dict[str, Any]:
+    async def get_latest_market_tick(self) -> Optional[Dict[str, Any]]:
         """
-        Asynchronously fetches real-time XAU-USDT market data.
-        If offline, gracefully falls back to synthetic simulation around exact $4,069 baseline.
+        Asynchronously fetches real-time Gold market data across redundant exchanges.
+        STRICT RULE: If all external exchange connections fail, returns None (never generates random synthetic prices).
         """
         loop = asyncio.get_running_loop()
         live_tick = await loop.run_in_executor(None, self._fetch_live_market_data_sync)
@@ -205,34 +275,7 @@ class LiveMarketDataFeed:
             logger.info(f"Connected to live market: {live_tick['source']} | Price: ${live_tick['close']:.2f} | Spread: ${live_tick['spread']:.2f}")
             return live_tick
 
-        # Fallback synthetic simulation around exactly $4,069.00 if offline
-        self.simulated_cycle += 1
-        now = datetime.now(timezone.utc)
-        import random
-        price_change = random.uniform(-1.40, 1.50)
-        if self.simulated_cycle % 12 == 0:
-            price_change = random.uniform(3.00, 5.20)  # London breakout test
-        elif self.simulated_cycle % 19 == 0:
-            price_change = random.uniform(-4.50, -2.20)  # Asian sweep test
-            
-        new_price = round(self.last_known_price + price_change, 2)
-        high_price = round(new_price + random.uniform(0.15, 0.80), 2)
-        low_price = round(new_price - random.uniform(0.15, 0.80), 2)
-        self.last_known_price = new_price
-        
-        return {
-            "timestamp": now,
-            "source": "SIMULATED_OFFLINE_FALLBACK (Base: $4069.00)",
-            "close": new_price,
-            "spread": round(random.uniform(0.15, 0.35), 2),
-            "atr_14": round(random.uniform(2.20, 3.80), 2),
-            "rsi_14": round(random.uniform(36.0, 66.0), 1),
-            "ema_200": round(new_price - 8.0, 2),
-            "vwap": round(new_price - 2.5, 2),
-            "asian_high": round(new_price - 3.5, 2),
-            "asian_low": round(new_price - 18.0, 2),
-            "high": high_price,
-            "low": low_price
-        }
+        logger.warning("⚠️ All live exchange API endpoints failed or timed out. No synthetic fallback will be generated. Returning None until live connection is restored.")
+        return None
 
 market_feed = LiveMarketDataFeed()

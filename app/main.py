@@ -2,6 +2,7 @@
 Main Entrypoint for Railway 24/7 Deployment.
 Initializes database ($100 balance), connects Telegram UI, and runs continuous trading loop.
 Listens to live XAU-USDT market prices via app/market_data.py.
+STRICT RULE: Never evaluates or trades on synthetic/random prices.
 """
 import asyncio
 import logging
@@ -25,11 +26,12 @@ logger = logging.getLogger("MainService")
 async def market_data_feed_loop():
     """
     Continuous market data feed for XAU-USDT.
-    On Railway, this connects directly to Bybit/Binance V5 linear API to fetch real-time live 5m bars,
+    On Railway, connects directly to CCXT & Bybit/Binance/OKX V5 REST API to fetch real-time live 5m bars,
     orderbook bid/ask spread, session VWAP, and Asian High/Low boundaries every few seconds.
-    If offline or rate limited, gracefully falls back to synthetic price simulation without interrupting service.
+    STRICT RULE: If all external exchange connections fail or time out, logs a warning and skips evaluation.
+    NEVER generates or trades on random synthetic prices.
     """
-    logger.info("Starting continuous market data evaluation loop...")
+    logger.info("Starting continuous real-time market data evaluation loop...")
     
     while True:
         try:
@@ -37,11 +39,14 @@ async def market_data_feed_loop():
                 await asyncio.sleep(2.0)
                 continue
                 
-            # Fetch latest live market tick from exchange (or fallback)
+            # Fetch latest live market tick from real exchange (returns None if offline)
             market_tick = await market_feed.get_latest_market_tick()
             
-            # Feed tick directly to paper trading engine & 4-Layer decision pipeline
-            paper_trader.process_new_market_data(market_tick)
+            if market_tick is None:
+                logger.warning("⚠️ Skipping evaluation cycle: No real-time live market data received from exchanges.")
+            else:
+                # Feed real tick directly to paper trading engine & 4-Layer decision pipeline
+                paper_trader.process_new_market_data(market_tick)
             
         except Exception as e:
             logger.error(f"Error in market data evaluation loop: {e}")
@@ -66,7 +71,7 @@ async def main():
         f"• Environment: <b>Railway Cloud ({config.ENV})</b>\n"
         f"• Current Balance: <b>${db.get_current_balance():.2f} USDT</b>\n"
         f"• Target Pair: <b>{config.SYMBOL} ({config.MAX_LEVERAGE}x Max Leverage)</b>\n"
-        f"• Live Price Engine: <b>Connected (Bybit/CCXT V5 API)</b>\n"
+        f"• Live Price Engine: <b>Strict Real-Time Feed (CCXT / Bybit / OKX / Binance)</b>\n"
         f"• UI Commands: Type /help or /status to monitor real-time performance."
     )
     

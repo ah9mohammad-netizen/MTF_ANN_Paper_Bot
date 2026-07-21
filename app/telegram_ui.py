@@ -201,7 +201,7 @@ class TelegramUI:
                 f"• Bot Status: <b>{'🟢 RUNNING 24/7' if paper_trader.is_running else '🟡 PAUSED'}</b>\n"
                 f"• Target Symbol: <b>{config.SYMBOL} ({config.EXCHANGE_ID.upper()})</b>\n"
                 f"• Last Market Price: <b>${market_feed.last_known_price:.2f} / oz</b>\n"
-                f"• Max Leverage: <b>{config.MAX_LEVERAGE}x</b>\n"
+                f"• Price Source: <b>{market_feed.last_valid_source}</b>\n"
                 f"• Open Active Trades: <b>{len(open_trades)}</b>\n"
                 f"• Storage Path (`Volume`): <code>{db.db_path}</code> (<b>{file_size_kb:.1f} KB</b>)\n"
                 f"• Database Engine: <b>Connected & Ready</b>"
@@ -293,6 +293,9 @@ class TelegramUI:
             await self.send_message("🟢 <b>Bot Resumed:</b> Automated paper trade execution is now active 24/7.", chat_id=chat_id)
 
         elif cmd_lower in ("/force_long", "/force_short"):
+            if market_feed.last_known_price <= 0:
+                await self.send_message("⚠️ Cannot dispatch force test: No live exchange price has been received yet.", chat_id=chat_id)
+                return
             direction = "LONG" if cmd_lower == "/force_long" else "SHORT"
             from datetime import datetime, timezone
             dummy_market = {
@@ -311,6 +314,6 @@ class TelegramUI:
                 "force_direction": direction
             }
             paper_trader.process_new_market_data(dummy_market)
-            await self.send_message(f"🧪 Forced test market tick for <b>{direction}</b> dispatched to engine.", chat_id=chat_id)
+            await self.send_message(f"🧪 Forced test market tick for <b>{direction}</b> dispatched to engine at live price ${market_feed.last_known_price:.2f}.", chat_id=chat_id)
 
 telegram_ui = TelegramUI()
