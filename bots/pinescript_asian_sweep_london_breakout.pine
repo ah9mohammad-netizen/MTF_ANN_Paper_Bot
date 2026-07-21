@@ -1,0 +1,103 @@
+//@version=5
+strategy("XAU-USDT Layered London Breakout & Asian Range Sweep [Gold-Scalp]", shorttitle="XAU_Layered_Breakout", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, commission_type=strategy.commission.percent, commission_value=0.04)
+
+// ==========================================
+// 1. INPUT CONFIGURATION & PARAMETERS
+// ==========================================
+var group_session = "─── Session & Macro Filter ───"
+asianSessionTime  = input.session("0000-0630", "Asian Range Session (UTC)", group=group_session)
+londonSessionTime = input.session("0700-1030", "London Breakout Window (UTC)", group=group_session)
+maxSpreadFilter   = input.float(0.40, "Maximum Allowable Spread ($)", group=group_session)
+
+var group_tech = "─── Structural & Volatility Indicators ───"
+emaTrendLen       = input.int(200, "Macro EMA Trend Length", group=group_tech)
+atrLen            = input.int(14, "ATR Volatility Length", group=group_tech)
+minAtrVol         = input.float(1.20, "Minimum 5m ATR Volatility ($/oz)", group=group_tech)
+rsiLen            = input.int(14, "RSI Length", group=group_tech)
+rsiOverbought     = input.float(72.0, "RSI Overbought Limit", group=group_tech)
+rsiOversold       = input.float(28.0, "RSI Oversold Limit", group=group_tech)
+
+var group_risk = "─── Dynamic Risk & Order Execution ───"
+slAtrMult         = input.float(1.5, "Stop Loss ATR Multiplier", group=group_risk)
+tp1RrRatio        = input.float(2.0, "Take Profit 1 R:R Multiplier", group=group_risk)
+tp2RrRatio        = input.float(3.5, "Take Profit 2 R:R Multiplier", group=group_risk)
+riskPerTradePct   = input.float(1.0, "Account Risk Per Trade (%)", group=group_risk)
+
+// ==========================================
+// 2. SESSION & STRUCTURAL CALCULATIONS
+// ==========================================
+inAsianSession  = not na(time(timeframe.period, asianSessionTime, "UTC"))
+inLondonSession = not na(time(timeframe.period, londonSessionTime, "UTC"))
+
+// Track Asian Session High and Low
+var float asianHigh = na
+var float asianLow  = na
+
+if inAsianSession
+    if not inAsianSession[1]
+        asianHigh := high
+        asianLow  := low
+    else
+        asianHigh := math.max(asianHigh, high)
+        asianLow  := math.min(asianLow, low)
+
+// Technical indicators
+ema200 = ta.ema(close, emaTrendLen)
+atr14  = ta.atr(atrLen)
+rsi14  = ta.rsi(close, rsiLen)
+vwap   = ta.vwap(close)
+
+// Plot Asian Session Range Box Boundaries
+plot(asianHigh, title="Asian Session High", color=color.red, style=plot.style_stepline, linewidth=2)
+plot(asianLow,  title="Asian Session Low",  color=color.green, style=plot.style_stepline, linewidth=2)
+plot(ema200,    title="Macro EMA 200",      color=color.blue, linewidth=2)
+plot(vwap,      title="Session VWAP",       color=color.orange, linewidth=1)
+
+// ==========================================
+// 3. LAYERED DECISION LOGIC
+// ==========================================
+// Layer 1: Session & Volatility Check
+layer1Pass = inLondonSession and atr14 >= minAtrVol
+
+// Layer 2: Structural Breakout & Sweep Conditions
+bullishBreakout = close > asianHigh and close > ema200 and close > vwap
+bearishBreakout = close < asianLow and close < ema200 and close < vwap
+
+// Asian Range Sweep Rejection (Mean Reversion inside trend)
+bullishSweepRejection = low <= asianLow and close > asianLow and close > ema200
+bearishSweepRejection = high >= asianHigh and close < asianHigh and close < ema200
+
+// Layer 3: Momentum Validation
+longValid  = layer1Pass and (bullishBreakout or bullishSweepRejection) and rsi14 < rsiOverbought
+shortValid = layer1Pass and (bearishBreakout or bearishSweepRejection) and rsi14 > rsiOversold
+
+// ==========================================
+// 4. RISK COMPUTATION & ENTRY EXECUTION
+// ==========================================
+if longValid and strategy.position_size == 0
+    slDist = atr14 * slAtrMult
+    slPrice = close - slDist
+    tpPrice = close + (slDist * tp1RrRatio)
+    
+    // Position sizing equation based on risk %
+    dollarRisk = strategy.equity * (riskPerTradePct / 100.0)
+    qtyOz = dollarRisk / slDist
+    
+    strategy.entry("XAU_Long", strategy.long, qty=qtyOz)
+    strategy.exit("XAU_Long_Exit", from_entry="XAU_Long", stop=slPrice, limit=tpPrice)
+    alert("🚀 [WEBHOOK] XAU-USDT LONG Entry at " + str.tostring(close, "#.##") + " | SL: " + str.tostring(slPrice, "#.##") + " | TP: " + str.tostring(tpPrice, "#.##"), alert.freq_once_per_bar_close)
+
+if shortValid and strategy.position_size == 0
+    slDist = atr14 * slAtrMult
+    slPrice = close + slDist
+    tpPrice = close - (slDist * tp1RrRatio)
+    
+    dollarRisk = strategy.equity * (riskPerTradePct / 100.0)
+    qtyOz = dollarRisk / slDist
+    
+    strategy.entry("XAU_Short", strategy.short, qty=qtyOz)
+    strategy.exit("XAU_Short_Exit", from_entry="XAU_Short", stop=slPrice, limit=tpPrice)
+    alert("🔴 [WEBHOOK] XAU-USDT SHORT Entry at " + str.tostring(close, "#.##") + " | SL: " + str.tostring(slPrice, "#.##") + " | TP: " + str.tostring(tpPrice, "#.##"), alert.freq_once_per_bar_close)
+
+// Background color highlight during London breakout window
+bgcolor(inLondonSession ? color.new(color.blue, 92) : na, title="London Breakout Window")
